@@ -20,6 +20,25 @@
 pthread_mutex_t stdout_lock; // 用于保护标准输出，防止日志交错
 
 /**
+ * @brief Helper function to determine Content-Type based on filename extension
+ * @param filename 文件路径或文件名
+ * @return 对应的MIME类型字符串
+ */
+const char* get_content_type(const char* filename) {
+    const char* dot = strrchr(filename, '.');
+    if (!dot || dot == filename) return "application/octet-stream"; // Default binary
+    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0) return "text/html";
+    if (strcmp(dot, ".css") == 0) return "text/css";
+    if (strcmp(dot, ".js") == 0) return "application/javascript";
+    if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(dot, ".png") == 0) return "image/png";
+    if (strcmp(dot, ".gif") == 0) return "image/gif";
+    if (strcmp(dot, ".json") == 0) return "application/json";
+    if (strcmp(dot, ".txt") == 0) return "text/plain";
+    return "application/octet-stream";
+}
+
+/**
  * @brief 创建并初始化服务器监听套接字
  * @return 成功返回监听套接字描述符，失败返回-1
  */
@@ -63,22 +82,60 @@ int create_socket() {
  */
 void send_error_response(int client_sock, int status_code, const char* status_message) {
     char header[MAX_HEADER_SIZE];
-    char body[MAX_PATH_SIZE];
+    char body_buffer[MAX_HEADER_SIZE]; // 用于通用错误页面或读取文件
+    char error_page_path[MAX_PATH_SIZE];
+    long content_length = 0;
+    const char* content_type_str = "text/html"; // 错误页面默认是HTML
 
-    // 构造HTML响应体
-    sprintf(body, "<html><head><title>%d %s</title></head><body><h1>%d %s</h1></body></html>", 
+    // 特殊处理 404 Not Found 错误，尝试服务 my404.html
+    if (status_code == 404) {
+        snprintf(error_page_path, sizeof(error_page_path), "%s/my404.html", WEBROOT);
+        int error_fd = open(error_page_path, O_RDONLY);
+
+        if (error_fd != -1) {
+            struct stat error_file_stat;
+            if (fstat(error_fd, &error_file_stat) == 0) {
+                content_length = error_file_stat.st_size;
+                
+                // 构造 HTTP 响应头
+                sprintf(header, "HTTP/1.1 %d %s\r\n"
+                                "Content-Type: %s\r\n"
+                                "Content-Length: %ld\r\n"
+                                "Server: C-Thread-Server/1.1\r\n"
+                                "Connection: close\r\n\r\n", 
+                        status_code, status_message, content_type_str, content_length);
+                send(client_sock, header, strlen(header), 0);
+
+                // 发送 my404.html 的内容
+                ssize_t num_read;
+                while ((num_read = read(error_fd, body_buffer, sizeof(body_buffer))) > 0) {
+                    if (send(client_sock, body_buffer, num_read, 0) < 0) {
+                        break; // 发送失败，客户端可能已关闭连接
+                    }
+                }
+                close(error_fd);
+                return; // 成功发送定制 404 页面，函数返回
+            }
+            close(error_fd); // fstat 失败，关闭文件描述符
+        }
+        // 如果 my404.html 不存在或无法访问，则回退到通用错误页面
+    }
+
+    // 通用错误响应 (或 404 无法服务定制页面时的回退)
+    sprintf(body_buffer, "<html><head><title>%d %s</title></head><body><h1>%d %s</h1><p>The requested resource could not be found.</p></body></html>", 
             status_code, status_message, status_code, status_message);
+    content_length = strlen(body_buffer);
 
-    // 构造HTTP响应头
+    // 构造 HTTP 响应头
     sprintf(header, "HTTP/1.1 %d %s\r\n"
-                    "Content-Type: text/html\r\n"
+                    "Content-Type: %s\r\n"
                     "Content-Length: %ld\r\n"
                     "Server: C-Thread-Server/1.1\r\n"
                     "Connection: close\r\n\r\n", 
-            status_code, status_message, strlen(body));
+            status_code, status_message, content_type_str, content_length);
 
     send(client_sock, header, strlen(header), 0);
-    send(client_sock, body, strlen(body), 0);
+    send(client_sock, body_buffer, strlen(body_buffer), 0);
 }
 
 /**
@@ -124,7 +181,12 @@ void* work_fun(void* arg) {
     pthread_mutex_unlock(&stdout_lock);
 
     char* method, *filename;
-    if (parse_http_request(request_buffer, &method, &filename) != 0) {
+    // strtok_r 会修改 request_buffer，因此需要在其修改前解析出 filename
+    char request_buffer_copy[MAX_HEADER_SIZE];
+    strncpy(request_buffer_copy, request_buffer, sizeof(request_buffer_copy) - 1);
+    request_buffer_copy[sizeof(request_buffer_copy) - 1] = '\0'; // 确保 null 终止
+
+    if (parse_http_request(request_buffer_copy, &method, &filename) != 0) {
         send_error_response(c, 400, "Bad Request");
         close(c);
         return NULL;
@@ -154,7 +216,16 @@ void* work_fun(void* arg) {
 
     struct stat file_stat;
     if (stat(full_path, &file_stat) < 0) {
-        send_error_response(c, 404, "Not Found");
+        send_error_response(c, 404, "Not Found"); // 文件不存在，发送 404
+        close(c);
+        return NULL;
+    }
+
+    // 检查是否是目录
+    if (S_ISDIR(file_stat.st_mode)) {
+        // 如果请求的是目录，可以考虑返回 403 Forbidden 或者尝试找 index.html
+        // 这里简化为返回 403
+        send_error_response(c, 403, "Forbidden");
         close(c);
         return NULL;
     }
@@ -166,13 +237,17 @@ void* work_fun(void* arg) {
         return NULL;
     }
 
+    // 根据文件扩展名获取 Content-Type
+    const char* content_type = get_content_type(full_path);
+
     // 构造200 OK响应
     char header[MAX_HEADER_SIZE];
     sprintf(header, "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: text/plain\r\n" // 可根据文件类型修改
+                    "Content-Type: %s\r\n" // 使用 get_content_type 获取的类型
                     "Content-Length: %ld\r\n"
-                    "Server: C-Thread-Server/1.1\r\n\r\n",
-            file_stat.st_size);
+                    "Server: C-Thread-Server/1.1\r\n"
+                    "Connection: close\r\n\r\n",
+            content_type, file_stat.st_size);
     
     send(c, header, strlen(header), 0);
 
